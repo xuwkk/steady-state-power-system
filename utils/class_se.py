@@ -6,6 +6,10 @@ Sources:
     2. MATPOWER SE: https://github.com/MATPOWER/mx-se
     3. PYPOWER: https://github.com/rwl/PYPOWER
 
+The original repo for this code can be found in my GitHub: https://github.com/xuwkk/steady-state-power-system
+
+Some code is removed if not related to the this task
+
 Author: W XU
 """
 
@@ -15,8 +19,8 @@ from pypower.idx_bus import *
 from pypower.idx_brch import *
 from pypower.idx_gen import *
 import scipy
-from mea_idx import define_mea_idx_noise
-from se_config import se_config
+from configs.config_mea_idx import define_mea_idx_noise
+from configs.config import se_config, opt
 import copy
 from scipy.stats.distributions import chi2
 
@@ -68,7 +72,7 @@ class SE:
         self.R_inv = np.diag(1/self.noise_sigma**2)        # R^-1 
         
         DoF = self.no_mea - 2*(self.no_bus - 1)            # Degree of Freedom
-        self.bdd_threshold = chi2.ppf(1-fpr, df = DoF)         # BDD detection threshold
+        self.bdd_threshold = chi2.ppf(1-fpr, df = DoF)     # BDD detection threshold
         
         """
         Incidence Matrix
@@ -103,13 +107,30 @@ class SE:
             else:
                 _cache2 = _cache2 + self.no_bus
         
+        # Calculate the admittance matrix
+        self._admittance_matrix()
+    
+    def update_reactance(self,x_new):
         """
-        Admittance matrix
+        Update reactance in self.case
         """
-        Ybus, Yf, Yt = makeYbus(case_int['baseMVA'], case_int['bus'], case_int['branch'])
+        self.case['branch'][:,BR_X] = x_new
+        self.case_int = ext2int(self.case)
+
+        # Update the admittance matrix
+        self._admittance_matrix()
+    
+    def _admittance_matrix(self):
+        """
+        Calculate the Admittance matrix according to the current admittance in self.case
+        """
+        Ybus, Yf, Yt = makeYbus(self.case_int['baseMVA'], self.case_int['bus'], self.case_int['branch'])
         self.Ybus = scipy.sparse.csr_matrix.todense(Ybus).getA()
         self.Yf = scipy.sparse.csr_matrix.todense(Yf).getA()
         self.Yt = scipy.sparse.csr_matrix.todense(Yt).getA()
+
+        self.Gsh = self.case['bus'][:,GS]/self.case['baseMVA']
+        self.Bsh = self.case['bus'][:,BS]/self.case['baseMVA']
     
     def run_opf(self, **kwargs):
         """
@@ -117,17 +138,10 @@ class SE:
         """
         
         case_opf = copy.deepcopy(self.case)
-        
-        # OPF settings
-        opt = ppoption()              # OPF options
-        opt['VERBOSE'] = 0
-        opt['OUT_ALL'] = 0
-        opt['OPF_FLOW_LIM'] = 1       # Constraint on the active power flow
-        
-        if 'active_load' in kwargs.keys():
+        if 'load_active' in kwargs.keys():
             # if a new load condition is given
-            case_opf['bus'][:,PD] = kwargs['active_load']
-            case_opf['bus'][:,QD] = kwargs['reactive_load']
+            case_opf['bus'][:,PD] = kwargs['load_active']
+            case_opf['bus'][:,QD] = kwargs['load_reactive']
         else:
             # Use the default load condition in the case file
             pass
@@ -154,6 +168,9 @@ class SE:
         z = np.concatenate([pf, pt, pi, vang, qf, qt, qi, vmag], axis = 0)
         
         z = self.IDX@z   # Select the measurement
+        #print(z.shape)
+        #print(self.R.shape)
+        
         z_noise = z + np.random.multivariate_normal(mean = np.zeros((self.no_mea,)), cov = self.R)
         z = np.expand_dims(z, axis = 1)
         z_noise = np.expand_dims(z_noise, axis = 1)
@@ -187,6 +204,8 @@ class SE:
         #print(( np.diag(self.Cf@v)).shape)
         #print((np.conj(self.Yf)).shape)
         #print((np.conj(v).shape))
+
+        # print(np.linalg.norm(self.Yf, 2))
         
         sf = np.diag(self.Cf@v)@np.conj(self.Yf)@np.conj(v)    # "from" complex power flow
         st = np.diag(self.Ct@v)@np.conj(self.Yt)@np.conj(v)    # "to" complex power flow
@@ -203,16 +222,77 @@ class SE:
 
         z_est = np.concatenate([pf, pt, pi, vang, qf, qt, qi, vmag], axis = 0)
         z_est = np.expand_dims(z_est, axis = 1)
+        z_est = self.IDX@z_est
         
         return z_est
         
     
-    def ac_se_pypower(self, z_noise, vang_ref, vmag_ref, **kwargs):
+    def jacobian(self, v_est):
+        """
+        Given the stationary state, Calculate the Jacobian matrix.
+        Return: the Jacobian matrix of full measurement
+        """
+        # 
+        # Compute the Jacobian matrix
+        [dsi_dvmag, dsi_dvang] = dSbus_dV(self.Ybus, v_est)   # si w.r.t. v
+        [dsf_dvang, dsf_dvmag, dst_dvang, dst_dvmag, _, _] = dSbr_dV(self.case_int['branch'], self.Yf, self.Yt, v_est)  # sf w.r.t. v
+
+        dpf_dvang = np.real(dsf_dvang)
+        dqf_dvang = np.imag(dsf_dvang)
+        dpf_dvmag = np.real(dsf_dvmag)
+        dqf_dvmag = np.imag(dsf_dvmag)
+        
+        dpt_dvang = np.real(dst_dvang)
+        dqt_dvang = np.imag(dst_dvang)   
+        dpt_dvmag = np.real(dst_dvmag)
+        dqt_dvmag = np.imag(dst_dvmag)  
+        
+        dpi_dvang = np.real(dsi_dvang)
+        dqi_dvang = np.imag(dsi_dvang)
+        dpi_dvmag = np.real(dsi_dvmag)
+        dqi_dvmag = np.imag(dsi_dvmag)
+        
+        dvang_dvang = np.eye(self.no_bus)
+        dvang_dvmag = np.zeros((self.no_bus, self.no_bus))
+        
+        dvmag_dvang = np.zeros((self.no_bus, self.no_bus))
+        dvmag_dvmag = np.eye(self.no_bus)
+
+        # z = [pf, pt, pi, vang, qf, qt, qi, vmag] in the current setting
+        J = np.block([
+            [dpf_dvang,    dpf_dvmag],
+            [dpt_dvang,    dpt_dvmag],
+            [dpi_dvang,    dpi_dvmag],
+            [dvang_dvang,  dvang_dvmag],
+            [dqf_dvang,    dqf_dvmag],
+            [dqt_dvang,    dqt_dvmag],
+            [dqi_dvang,    dqi_dvmag],
+            [dvmag_dvang,  dvmag_dvmag]
+        ])
+        # # Remove the reference bus
+        # J = np.block([
+        #     [dpf_dvang[:,self.non_ref_index],    dpf_dvmag[:,self.non_ref_index]],
+        #     [dpt_dvang[:,self.non_ref_index],    dpt_dvmag[:,self.non_ref_index]],
+        #     [dpi_dvang[:,self.non_ref_index],    dpi_dvmag[:,self.non_ref_index]],
+        #     [dvang_dvang[:,self.non_ref_index],  dvang_dvmag[:,self.non_ref_index]],
+        #     [dqf_dvang[:,self.non_ref_index],    dqf_dvmag[:,self.non_ref_index]],
+        #     [dqt_dvang[:,self.non_ref_index],    dqt_dvmag[:,self.non_ref_index]],
+        #     [dqi_dvang[:,self.non_ref_index],    dqi_dvmag[:,self.non_ref_index]],
+        #     [dvmag_dvang[:,self.non_ref_index],  dvmag_dvmag[:,self.non_ref_index]]
+        # ])
+        
+        J = np.array(J)         # Force convert to numpy array
+
+        return J     # This J is not full column rank as the reference bus is not removed.
+
+    def ac_se_pypower(self, z_noise, vang_ref, vmag_ref, is_honest = True, **kwargs):
         """
         AC-SE based on pypower
         v_initial: initial gauss on the 
+        is_honest: 
+        If True, then honest state estimation is used where the Jacobian matrix is updated at each iteration
+        If False, then dishonest state estimation is used where the Jacobian matrix is fixed at the initial point.
         """
-        
         """
         Verbose
         """
@@ -221,6 +301,7 @@ class SE:
             tol = 1e-5,    
             max_it = 100     
             verbose = 0
+            
         else:
             tol = kwargs['config']['tol']    
             max_it = kwargs['config']['max_it']
@@ -234,6 +315,15 @@ class SE:
         vang_est, vmag_est = self.construct_v_flat(vang_ref, vmag_ref)      # Flat start state
         v_est = vmag_est*np.exp(1j*vang_est)             # (no_bus, )
         
+        # For the first run and also the dishonest Jacobian, the below value will never change
+        J = self.jacobian(v_est)       # Jacobian matrix on the flat state 
+        # Remove the reference columns (for both angle and magnitude)
+        J = np.delete(J, [self.ref_index, self.ref_index+self.no_bus], 1)
+        J = self.IDX@J          # Select the measurement
+        # Update rule: x := x_0 + (Jx0^T * R^-1 * Jx0)^-1 * Jx0^T * R^-1 * (z-h(x_0))
+        G = J.T@self.R_inv@J
+        G_inv = np.linalg.inv(G)
+
         """
         Gauss-Newton Iteration
         """
@@ -243,65 +333,30 @@ class SE:
             ite_no += 1
 
             # Compute estimated measurement
-            z_est = self.h_x_pypower(v_est)       # z is 2D array (no_mea, 1)
-            z_est = self.IDX@z_est 
+            z_est = self.h_x_pypower(v_est)       # z is 2D array (no_mea, 1) 
             
-            # Compute the Jacobian matrix
-            [dsi_dvmag, dsi_dvang] = dSbus_dV(self.Ybus, v_est)   # si w.r.t. v
-            [dsf_dvang, dsf_dvmag, dst_dvang, dst_dvmag, _, _] = dSbr_dV(self.case_int['branch'], self.Yf, self.Yt, v_est)  # sf w.r.t. v
-            
-            dpf_dvang = np.real(dsf_dvang)
-            dqf_dvang = np.imag(dsf_dvang)
-            dpf_dvmag = np.real(dsf_dvmag)
-            dqf_dvmag = np.imag(dsf_dvmag)
-            
-            dpt_dvang = np.real(dst_dvang)
-            dqt_dvang = np.imag(dst_dvang)   
-            dpt_dvmag = np.real(dst_dvmag)
-            dqt_dvmag = np.imag(dst_dvmag)  
-            
-            dpi_dvang = np.real(dsi_dvang)
-            dqi_dvang = np.imag(dsi_dvang)
-            dpi_dvmag = np.real(dsi_dvmag)
-            dqi_dvmag = np.imag(dsi_dvmag)
-            
-            dvang_dvang = np.eye(self.no_bus)
-            dvang_dvmag = np.zeros((self.no_bus, self.no_bus))
-            
-            dvmag_dvang = np.zeros((self.no_bus, self.no_bus))
-            dvmag_dvmag = np.eye(self.no_bus)
-            
-            # z = [pf, pt, pi, vang, qf, qt, qi, vmag] in the current setting
-            # Remove the reference bus
-            J = np.block([
-                [dpf_dvang[:,self.non_ref_index],    dpf_dvmag[:,self.non_ref_index]],
-                [dpt_dvang[:,self.non_ref_index],    dpt_dvmag[:,self.non_ref_index]],
-                [dpi_dvang[:,self.non_ref_index],    dpi_dvmag[:,self.non_ref_index]],
-                [dvang_dvang[:,self.non_ref_index],  dvang_dvmag[:,self.non_ref_index]],
-                [dqf_dvang[:,self.non_ref_index],    dqf_dvmag[:,self.non_ref_index]],
-                [dqt_dvang[:,self.non_ref_index],    dqt_dvmag[:,self.non_ref_index]],
-                [dqi_dvang[:,self.non_ref_index],    dqi_dvmag[:,self.non_ref_index]],
-                [dvmag_dvang[:,self.non_ref_index],  dvmag_dvmag[:,self.non_ref_index]]
-            ])
-            
-            J = np.array(J)         # Force convert to numpy array
-            
-            J = self.IDX@J          # Select the measurement
-            
-            # Update rule: x := x_0 + (Jx0^T * R^-1 * Jx0)^-1 * Jx0^T * R^-1 * (z-h(x_0))
-            G = J.T@self.R_inv@J
+            if is_honest == False:
+                # No need to update the Jacobian
+                #print('not update')
+                pass
+            else:
+                #print('update')
+                # Update the Jacobian
+                J = self.jacobian(v_est)         # It is repeated for the first run on v flat!
+                J = np.delete(J, [self.ref_index, self.ref_index+self.no_bus], 1)
+                J = self.IDX@J          # Select the measurement
+                # Update rule: x := x_0 + (Jx0^T * R^-1 * Jx0)^-1 * Jx0^T * R^-1 * (z-h(x_0))
+                G = J.T@self.R_inv@J
+                G_inv = np.linalg.inv(G)
             
             # Test observability
             rankG = np.linalg.matrix_rank(G)
-            
             if rankG < G.shape[0]:
                 print(f'The current measurement setting is not observable.')
                 break
             
             F = J.T@self.R_inv@(z_noise-z_est)
-            
-            dx = (np.linalg.inv(G)@F).flatten()  # Note that the voltages are 1D array
-            
+            dx = (G_inv@F).flatten()  # Note that the voltages are 1D array
             normF = np.linalg.norm(F, np.inf) 
             
             if verbose == 0:
@@ -319,13 +374,11 @@ class SE:
             v_est = vmag_est*np.exp(1j*vang_est)
         
         return v_est
-    
-    def bdd_residual(self, z_noise, vang_ref, vmag_ref):
+
+    def bdd_residual(self, z_noise, v_est):
         """
-        Find the residual of chi^2 detector
+        Find the residual of chi^2 detector given the estimated state
         """
-        # Do state estimation
-        v_est = self.ac_se_pypower(z_noise, vang_ref, vmag_ref)
         # Find z_est
         z_est = self.h_x_pypower(v_est)
         
@@ -339,7 +392,7 @@ if __name__ == "__main__":
     case = case14()
     
     # Define measurement idx
-    mea_idx, no_mea, noise_sigma = define_mea_idx_noise(case, 'full')
+    mea_idx, no_mea, noise_sigma = define_mea_idx_noise(case, 'FULL')
     # Instance the state estimation class
     se = SE(case, noise_sigma=noise_sigma, idx=mea_idx, fpr = 0.02)
     
@@ -349,14 +402,16 @@ if __name__ == "__main__":
     opt['OUT_ALL'] = 0
     opt['OPF_FLOW_LIM'] = 1       # Constraint on the active power flow
     result = runopf(case, opt)
+
+    print(result['success'])
     
     # Construct the measurement
     z, z_noise, vang_ref, vmag_ref = se.construct_mea(result) # Get the measurement
     
     # Run AC-SE
     se_config['verbose'] = 1
-    v_est = se.ac_se_pypower(z_noise, vang_ref, vmag_ref, config = se_config)
-    residual = se.bdd_residual(z_noise, vang_ref, vmag_ref)    
+    v_est, _ = se.ac_se_pypower(z_noise, vang_ref, vmag_ref, config = se_config)
+    residual = se.bdd_residual(z_noise, v_est)    
     print(f'BDD threshold: {se.bdd_threshold}')
     print(f'residual: {residual}')
     

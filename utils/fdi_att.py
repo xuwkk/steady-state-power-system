@@ -4,13 +4,9 @@ Inherited from the state estimation tool run_AC_SE
 Author: W XU 
 """
 
-from run_AC_SE import SE
-from mea_idx import define_mea_idx_noise
-from se_config import se_config
+from utils.class_se import SE
 from pypower.api import *
 import numpy as np
-import random
-import matplotlib.pyplot as plt
 import warnings
 
 class FDI(SE):
@@ -18,7 +14,18 @@ class FDI(SE):
     def __init__(self, case, noise_sigma, idx, fpr):
         super().__init__(case, noise_sigma, idx, fpr)
     
-    def gen_att(self, v_est, att_spec):
+    def gen_ran_att(self, z_noise, att_ratio_max):
+        """
+        Generate a random attack without using the knowledge of model
+        att_ratio_max: the maximum change ratio of each measurement
+        """
+        att_ratio = -att_ratio_max + att_ratio_max*2*np.random.rand(z_noise.shape[0])
+        att_ratio = np.expand_dims(att_ratio, axis = 1)
+        z_att_noise = z_noise * (1+att_ratio)
+
+        return z_att_noise
+
+    def gen_fdi_att(self, v_est, att_spec):
         """
         Generate a single FDI attack based on the Given state
         Only the non-reference bus can be attacked
@@ -50,31 +57,5 @@ class FDI(SE):
         
         v_att = vmag_att * np.exp(1j*vang_att)
         
-        return v_att        
-
-"""
-An example
-"""
-if __name__ == "__main__":
-    case = case14()
-    # Define measurement idx
-    mea_idx, no_mea, noise_sigma = define_mea_idx_noise(case, 'full')
-    # Instance the Class FDI
-    fdi = FDI(case, noise_sigma=noise_sigma, idx=mea_idx)
-    # run opf
-    result = fdi.run_opf()
-    # Construct the measurement
-    z, z_noise, vang_ref, vmag_ref = fdi.construct_mea(result) # Get the measurement
-    # Run AC-SE
-    se_config['verbose'] = 1
-    v_est = fdi.ac_se_pypower(z_noise, vang_ref, vmag_ref, config = se_config)
-    
-    # Attack specification
-    att_spec = {}
-    att_spec['ang_posi'] = random.sample(range(fdi.no_bus), 1)
-    att_spec['ang_str'] = 0.2
-    att_spec['mag_posi'] = []
-    att_spec['mag_str'] = 0
-    # Generate FDI attack
-    v_att = fdi.gen_att(v_est, att_spec)
+        return v_att, ang_posi
     

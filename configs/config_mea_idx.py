@@ -13,8 +13,8 @@ def define_mea_idx_noise(case, choice):
     noise setting
     """
     mea_noise_std = {}
-    rtu_noise_std = 0.005
-    pmu_noise_std = 0.001
+    rtu_noise_std = 0.01       # std on RTU measurement noises
+    pmu_noise_std = 0.001      # std on RTU measuremnet
     mea_noise_std['pf'] = rtu_noise_std
     mea_noise_std['pt'] = rtu_noise_std
     mea_noise_std['pi'] = rtu_noise_std
@@ -29,7 +29,7 @@ def define_mea_idx_noise(case, choice):
     """
     idx = {}
     
-    if choice == 'full':
+    if choice == 'FULL':
         """
         Full Measurement
         """
